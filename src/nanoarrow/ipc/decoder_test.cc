@@ -56,6 +56,7 @@ struct ArrowIpcField {
   struct ArrowArray* array;
   int64_t buffer_offset;
   int64_t dictionary_id;
+  int64_t view_index;
 };
 
 struct ArrowIpcDecoderPrivate {
@@ -2781,5 +2782,377 @@ TEST(NanoarrowIpcTest, NanoarrowIpcDecodeEmptyArrayOffsets) {
     int32_t first_offset = -1;
     memcpy(&first_offset, strings->buffers[1], sizeof(first_offset));
     EXPECT_EQ(first_offset, 0);
+  }
+}
+
+static void MakeViewTypesSchemaMessage(struct ArrowBuffer* out) {
+  flatcc_builder_t builder;
+  flatcc_builder_init(&builder);
+
+  ASSERT_EQ(ns(Message_start_as_root(&builder)), 0);
+  ASSERT_EQ(ns(Message_version_add(&builder, ns(MetadataVersion_V5))), 0);
+  ASSERT_EQ(ns(Message_header_Schema_start(&builder)), 0);
+  ASSERT_EQ(ns(Schema_endianness_add(&builder, ns(Endianness_Little))), 0);
+  ASSERT_EQ(ns(Schema_fields_start(&builder)), 0);
+
+  ASSERT_EQ(ns(Schema_fields_push_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_name_create_str(&builder, "binary_view")), 0);
+  ASSERT_EQ(ns(Field_type_BinaryView_create(&builder)), 0);
+  ASSERT_NE(ns(Schema_fields_push_end(&builder)), nullptr);
+
+  ASSERT_EQ(ns(Schema_fields_push_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_name_create_str(&builder, "string_view")), 0);
+  ASSERT_EQ(ns(Field_type_Utf8View_create(&builder)), 0);
+  ASSERT_NE(ns(Schema_fields_push_end(&builder)), nullptr);
+
+  // A list view, a large list view and a run-end encoded field, each with an
+  // int32 or utf8 child
+  ASSERT_EQ(ns(Schema_fields_push_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_name_create_str(&builder, "list_view")), 0);
+  ASSERT_EQ(ns(Field_type_ListView_create(&builder)), 0);
+  ASSERT_EQ(ns(Field_children_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_children_push_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_name_create_str(&builder, "item")), 0);
+  ASSERT_EQ(ns(Field_type_Int_create(&builder, 32, true)), 0);
+  ASSERT_NE(ns(Field_children_push_end(&builder)), nullptr);
+  ASSERT_EQ(ns(Field_children_end(&builder)), 0);
+  ASSERT_NE(ns(Schema_fields_push_end(&builder)), nullptr);
+
+  ASSERT_EQ(ns(Schema_fields_push_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_name_create_str(&builder, "large_list_view")), 0);
+  ASSERT_EQ(ns(Field_type_LargeListView_create(&builder)), 0);
+  ASSERT_EQ(ns(Field_children_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_children_push_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_name_create_str(&builder, "item")), 0);
+  ASSERT_EQ(ns(Field_type_Int_create(&builder, 32, true)), 0);
+  ASSERT_NE(ns(Field_children_push_end(&builder)), nullptr);
+  ASSERT_EQ(ns(Field_children_end(&builder)), 0);
+  ASSERT_NE(ns(Schema_fields_push_end(&builder)), nullptr);
+
+  ASSERT_EQ(ns(Schema_fields_push_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_name_create_str(&builder, "run_end_encoded")), 0);
+  ASSERT_EQ(ns(Field_type_RunEndEncoded_create(&builder)), 0);
+  ASSERT_EQ(ns(Field_children_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_children_push_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_name_create_str(&builder, "run_ends")), 0);
+  ASSERT_EQ(ns(Field_type_Int_create(&builder, 32, true)), 0);
+  ASSERT_NE(ns(Field_children_push_end(&builder)), nullptr);
+  ASSERT_EQ(ns(Field_children_push_start(&builder)), 0);
+  ASSERT_EQ(ns(Field_name_create_str(&builder, "values")), 0);
+  ASSERT_EQ(ns(Field_nullable_add(&builder, true)), 0);
+  ASSERT_EQ(ns(Field_type_Utf8_create(&builder)), 0);
+  ASSERT_NE(ns(Field_children_push_end(&builder)), nullptr);
+  ASSERT_EQ(ns(Field_children_end(&builder)), 0);
+  ASSERT_NE(ns(Schema_fields_push_end(&builder)), nullptr);
+
+  ASSERT_EQ(ns(Schema_fields_end(&builder)), 0);
+  ASSERT_EQ(ns(Message_header_Schema_end(&builder)), 0);
+  ASSERT_EQ(ns(Message_bodyLength_add(&builder, 0)), 0);
+  ASSERT_NE(ns(Message_end_as_root(&builder)), 0);
+
+  ASSERT_NO_FATAL_FAILURE(FinishEncapsulatedMessage(&builder, out));
+  flatcc_builder_clear(&builder);
+}
+
+TEST(NanoarrowIpcTest, NanoarrowIpcDecodeViewAndRunEndEncodedSchema) {
+  nanoarrow::UniqueBuffer message;
+  ASSERT_NO_FATAL_FAILURE(MakeViewTypesSchemaMessage(message.get()));
+
+  struct ArrowBufferView data;
+  data.data.as_uint8 = message->data;
+  data.size_bytes = message->size_bytes;
+
+  struct ArrowError error;
+  nanoarrow::ipc::UniqueDecoder decoder;
+  ASSERT_EQ(ArrowIpcDecoderInit(decoder.get()), NANOARROW_OK);
+  ASSERT_EQ(ArrowIpcDecoderVerifyHeader(decoder.get(), data, &error), NANOARROW_OK)
+      << error.message;
+  ASSERT_EQ(ArrowIpcDecoderDecodeHeader(decoder.get(), data, &error), NANOARROW_OK)
+      << error.message;
+
+  nanoarrow::UniqueSchema schema;
+  ASSERT_EQ(ArrowIpcDecoderDecodeSchema(decoder.get(), schema.get(), &error),
+            NANOARROW_OK)
+      << error.message;
+  ASSERT_EQ(schema->n_children, 5);
+  EXPECT_STREQ(schema->children[0]->name, "binary_view");
+  EXPECT_STREQ(schema->children[0]->format, "vz");
+  EXPECT_STREQ(schema->children[1]->name, "string_view");
+  EXPECT_STREQ(schema->children[1]->format, "vu");
+
+  EXPECT_STREQ(schema->children[2]->name, "list_view");
+  EXPECT_STREQ(schema->children[2]->format, "+vl");
+  ASSERT_EQ(schema->children[2]->n_children, 1);
+  EXPECT_STREQ(schema->children[2]->children[0]->name, "item");
+  EXPECT_STREQ(schema->children[2]->children[0]->format, "i");
+
+  EXPECT_STREQ(schema->children[3]->name, "large_list_view");
+  EXPECT_STREQ(schema->children[3]->format, "+vL");
+  ASSERT_EQ(schema->children[3]->n_children, 1);
+  EXPECT_STREQ(schema->children[3]->children[0]->format, "i");
+
+  EXPECT_STREQ(schema->children[4]->name, "run_end_encoded");
+  EXPECT_STREQ(schema->children[4]->format, "+r");
+  ASSERT_EQ(schema->children[4]->n_children, 2);
+  EXPECT_STREQ(schema->children[4]->children[0]->name, "run_ends");
+  EXPECT_STREQ(schema->children[4]->children[0]->format, "i");
+  EXPECT_STREQ(schema->children[4]->children[1]->name, "values");
+  EXPECT_STREQ(schema->children[4]->children[1]->format, "u");
+
+  // The schema can be used to decode record batches
+  ASSERT_EQ(ArrowIpcDecoderSetSchema(decoder.get(), schema.get(), &error), NANOARROW_OK)
+      << error.message;
+}
+
+// A binary view or string view element: up to 12 bytes are stored inline, longer
+// values refer to a variadic data buffer.
+static void AppendView(struct ArrowBuffer* views, const std::string& value,
+                       int32_t buffer_index, int32_t offset) {
+  uint8_t view[16] = {0};
+  int32_t size = static_cast<int32_t>(value.size());
+  memcpy(view, &size, sizeof(size));
+  if (size <= 12) {
+    memcpy(view + 4, value.data(), value.size());
+  } else {
+    memcpy(view + 4, value.data(), 4);
+    memcpy(view + 8, &buffer_index, sizeof(buffer_index));
+    memcpy(view + 12, &offset, sizeof(offset));
+  }
+  ASSERT_EQ(ArrowBufferAppend(views, view, sizeof(view)), NANOARROW_OK);
+}
+
+// Builds an encapsulated RecordBatch message (and its body) for a schema with a
+// string_view column and a binary_view column. The string_view column has one
+// variadic buffer and the binary_view column has two. n_counts < 0 omits
+// RecordBatch.variadicBufferCounts; otherwise the first n_counts of `counts` are
+// written. n_buffers < 0 writes every buffer.
+static const char* kLongString = "a string that is not inlined";
+static const char* kLongBinary = "a binary value that is not inlined";
+
+static void MakeViewRecordBatchMessage(int64_t n_counts, const int64_t* counts,
+                                       int64_t n_buffers, struct ArrowBuffer* out,
+                                       struct ArrowBuffer* body) {
+  std::vector<struct ns(Buffer)> buffers;
+  auto append_buffer = [&](const void* data, int64_t size_bytes) {
+    struct ns(Buffer) buffer;
+    buffer.offset = body->size_bytes;
+    buffer.length = size_bytes;
+    buffers.push_back(buffer);
+    ASSERT_EQ(ArrowBufferAppend(body, data, size_bytes), NANOARROW_OK);
+    while (body->size_bytes % 8 != 0) {
+      ASSERT_EQ(ArrowBufferAppendUInt8(body, 0), NANOARROW_OK);
+    }
+  };
+
+  // string_view column: ["foo", kLongString] with one variadic buffer
+  nanoarrow::UniqueBuffer string_views;
+  ASSERT_NO_FATAL_FAILURE(AppendView(string_views.get(), "foo", 0, 0));
+  ASSERT_NO_FATAL_FAILURE(AppendView(string_views.get(), kLongString, 0, 0));
+  ASSERT_NO_FATAL_FAILURE(append_buffer(nullptr, 0));
+  ASSERT_NO_FATAL_FAILURE(append_buffer(string_views->data, string_views->size_bytes));
+  ASSERT_NO_FATAL_FAILURE(append_buffer(kLongString, strlen(kLongString)));
+
+  // binary_view column: [kLongBinary, "xy"] with two variadic buffers, of which the
+  // second holds the out-of-line value
+  nanoarrow::UniqueBuffer binary_views;
+  ASSERT_NO_FATAL_FAILURE(AppendView(binary_views.get(), kLongBinary, 1, 3));
+  ASSERT_NO_FATAL_FAILURE(AppendView(binary_views.get(), "xy", 0, 0));
+  std::string second_data = std::string("---") + kLongBinary;
+  ASSERT_NO_FATAL_FAILURE(append_buffer(nullptr, 0));
+  ASSERT_NO_FATAL_FAILURE(append_buffer(binary_views->data, binary_views->size_bytes));
+  ASSERT_NO_FATAL_FAILURE(append_buffer("unused", 6));
+  ASSERT_NO_FATAL_FAILURE(append_buffer(second_data.data(), second_data.size()));
+
+  if (n_buffers >= 0) {
+    buffers.resize(n_buffers);
+  }
+
+  flatcc_builder_t builder;
+  flatcc_builder_init(&builder);
+
+  ASSERT_EQ(ns(Message_start_as_root(&builder)), 0);
+  ASSERT_EQ(ns(Message_version_add(&builder, ns(MetadataVersion_V5))), 0);
+  ASSERT_EQ(ns(Message_header_RecordBatch_start(&builder)), 0);
+  ASSERT_EQ(ns(RecordBatch_length_add(&builder, 2)), 0);
+  std::vector<struct ns(FieldNode)> nodes(2);
+  for (auto& node : nodes) {
+    node.length = 2;
+    node.null_count = 0;
+  }
+  ASSERT_EQ(ns(RecordBatch_nodes_create(&builder, nodes.data(), nodes.size())), 0);
+  ASSERT_EQ(ns(RecordBatch_buffers_create(&builder, buffers.data(), buffers.size())), 0);
+  if (n_counts >= 0) {
+    ASSERT_EQ(ns(RecordBatch_variadicBufferCounts_create(&builder, counts,
+                                                         static_cast<size_t>(n_counts))),
+              0);
+  }
+  ASSERT_EQ(ns(Message_header_RecordBatch_end(&builder)), 0);
+  ASSERT_EQ(ns(Message_bodyLength_add(&builder, body->size_bytes)), 0);
+  ASSERT_NE(ns(Message_end_as_root(&builder)), 0);
+
+  ASSERT_NO_FATAL_FAILURE(FinishEncapsulatedMessage(&builder, out));
+  flatcc_builder_clear(&builder);
+}
+
+static void SetViewSchema(struct ArrowIpcDecoder* decoder) {
+  nanoarrow::UniqueSchema schema;
+  ArrowSchemaInit(schema.get());
+  ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 2), NANOARROW_OK);
+  ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_STRING_VIEW),
+            NANOARROW_OK);
+  ASSERT_EQ(ArrowSchemaSetType(schema->children[1], NANOARROW_TYPE_BINARY_VIEW),
+            NANOARROW_OK);
+
+  struct ArrowError error;
+  ASSERT_EQ(ArrowIpcDecoderSetSchema(decoder, schema.get(), &error), NANOARROW_OK)
+      << error.message;
+  ASSERT_EQ(ArrowIpcDecoderSetEndianness(decoder, NANOARROW_IPC_ENDIANNESS_LITTLE),
+            NANOARROW_OK);
+}
+
+static void ExpectStringViewColumn(const struct ArrowArrayView* array_view) {
+  ASSERT_EQ(array_view->storage_type, NANOARROW_TYPE_STRING_VIEW);
+  ASSERT_EQ(array_view->length, 2);
+  EXPECT_EQ(array_view->n_variadic_buffers, 1);
+  EXPECT_EQ(ArrowArrayViewGetStringUnsafe(array_view, 0), ArrowCharView("foo"));
+  EXPECT_EQ(ArrowArrayViewGetStringUnsafe(array_view, 1), ArrowCharView(kLongString));
+}
+
+static void ExpectBinaryViewColumn(const struct ArrowArrayView* array_view) {
+  ASSERT_EQ(array_view->storage_type, NANOARROW_TYPE_BINARY_VIEW);
+  ASSERT_EQ(array_view->length, 2);
+  EXPECT_EQ(array_view->n_variadic_buffers, 2);
+  struct ArrowStringView value0 = {
+      reinterpret_cast<const char*>(
+          ArrowArrayViewGetBytesUnsafe(array_view, 0).data.data),
+      ArrowArrayViewGetBytesUnsafe(array_view, 0).size_bytes};
+  struct ArrowStringView value1 = {
+      reinterpret_cast<const char*>(
+          ArrowArrayViewGetBytesUnsafe(array_view, 1).data.data),
+      ArrowArrayViewGetBytesUnsafe(array_view, 1).size_bytes};
+  EXPECT_EQ(value0, ArrowCharView(kLongBinary));
+  EXPECT_EQ(value1, ArrowCharView("xy"));
+}
+
+TEST(NanoarrowIpcTest, NanoarrowIpcDecodeViewRecordBatch) {
+  struct ArrowError error;
+  const int64_t counts[] = {1, 2};
+
+  nanoarrow::UniqueBuffer message;
+  nanoarrow::UniqueBuffer body_buffer;
+  ASSERT_NO_FATAL_FAILURE(
+      MakeViewRecordBatchMessage(2, counts, -1, message.get(), body_buffer.get()));
+
+  nanoarrow::ipc::UniqueDecoder decoder;
+  ASSERT_EQ(ArrowIpcDecoderInit(decoder.get()), NANOARROW_OK);
+  ASSERT_NO_FATAL_FAILURE(SetViewSchema(decoder.get()));
+
+  struct ArrowBufferView data;
+  data.data.as_uint8 = message->data;
+  data.size_bytes = message->size_bytes;
+  ASSERT_EQ(ArrowIpcDecoderVerifyHeader(decoder.get(), data, &error), NANOARROW_OK)
+      << error.message;
+  ASSERT_EQ(ArrowIpcDecoderDecodeHeader(decoder.get(), data, &error), NANOARROW_OK)
+      << error.message;
+
+  struct ArrowBufferView body;
+  body.data.as_uint8 = body_buffer->data;
+  body.size_bytes = body_buffer->size_bytes;
+
+  // Each column on its own: the second column's buffers follow the first column's
+  // variadic buffer
+  struct ArrowArrayView* array_view;
+  ASSERT_EQ(ArrowIpcDecoderDecodeArrayView(decoder.get(), body, 0, &array_view, &error),
+            NANOARROW_OK)
+      << error.message;
+  ASSERT_NO_FATAL_FAILURE(ExpectStringViewColumn(array_view));
+  ASSERT_EQ(ArrowIpcDecoderDecodeArrayView(decoder.get(), body, 1, &array_view, &error),
+            NANOARROW_OK)
+      << error.message;
+  ASSERT_NO_FATAL_FAILURE(ExpectBinaryViewColumn(array_view));
+
+  // The whole batch, as an array that either copies or shares the body
+  for (bool shared : {false, true}) {
+    SCOPED_TRACE(shared ? "shared body" : "borrowed body");
+    nanoarrow::UniqueArray array;
+    if (shared) {
+      nanoarrow::UniqueBuffer body_copy;
+      ASSERT_EQ(ArrowBufferAppend(body_copy.get(), body.data.data, body.size_bytes),
+                NANOARROW_OK);
+      nanoarrow::UniqueBuffer shared_body;
+      ASSERT_EQ(ArrowSharedBufferInit(shared_body.get(), body_copy.get()), NANOARROW_OK);
+      ASSERT_EQ(ArrowIpcDecoderDecodeArrayFromShared(
+                    decoder.get(), shared_body.get(), -1, array.get(),
+                    NANOARROW_VALIDATION_LEVEL_FULL, &error),
+                NANOARROW_OK)
+          << error.message;
+    } else {
+      ASSERT_EQ(ArrowIpcDecoderDecodeArray(decoder.get(), body, -1, array.get(),
+                                           NANOARROW_VALIDATION_LEVEL_FULL, &error),
+                NANOARROW_OK)
+          << error.message;
+    }
+
+    // Two fixed buffers, the variadic buffers and the variadic sizes
+    ASSERT_EQ(array->n_children, 2);
+    EXPECT_EQ(array->children[0]->n_buffers, 4);
+    EXPECT_EQ(array->children[1]->n_buffers, 5);
+
+    nanoarrow::UniqueSchema schema;
+    ArrowSchemaInit(schema.get());
+    ASSERT_EQ(ArrowSchemaSetTypeStruct(schema.get(), 2), NANOARROW_OK);
+    ASSERT_EQ(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_STRING_VIEW),
+              NANOARROW_OK);
+    ASSERT_EQ(ArrowSchemaSetType(schema->children[1], NANOARROW_TYPE_BINARY_VIEW),
+              NANOARROW_OK);
+    nanoarrow::UniqueArrayView decoded;
+    ASSERT_EQ(ArrowArrayViewInitFromSchema(decoded.get(), schema.get(), &error),
+              NANOARROW_OK);
+    ASSERT_EQ(ArrowArrayViewSetArray(decoded.get(), array.get(), &error), NANOARROW_OK)
+        << error.message;
+    ASSERT_EQ(
+        ArrowArrayViewValidate(decoded.get(), NANOARROW_VALIDATION_LEVEL_FULL, &error),
+        NANOARROW_OK)
+        << error.message;
+    ASSERT_NO_FATAL_FAILURE(ExpectStringViewColumn(decoded->children[0]));
+    ASSERT_NO_FATAL_FAILURE(ExpectBinaryViewColumn(decoded->children[1]));
+  }
+}
+
+TEST(NanoarrowIpcTest, NanoarrowIpcDecodeViewRecordBatchErrors) {
+  struct ArrowError error;
+  nanoarrow::ipc::UniqueDecoder decoder;
+  ASSERT_EQ(ArrowIpcDecoderInit(decoder.get()), NANOARROW_OK);
+  ASSERT_NO_FATAL_FAILURE(SetViewSchema(decoder.get()));
+
+  struct Case {
+    int64_t n_counts;
+    std::vector<int64_t> counts;
+    int64_t n_buffers;
+    std::string message;
+  };
+  const std::vector<Case> cases = {
+      {-1, {}, -1, "Expected variadic buffer counts for 2 view fields"},
+      {1, {1}, -1, "Expected 2 variadic buffer counts in message but found 1"},
+      {3, {1, 2, 0}, -1, "Expected 2 variadic buffer counts in message but found 3"},
+      {2, {-1, 2}, -1, "Invalid variadic buffer count -1"},
+      {2, {1, 8}, -1, "Invalid variadic buffer count 8"},
+      {2, {1, 1}, -1, "Expected 6 buffers in message but found 7"},
+      {2, {1, 2}, 6, "Expected 7 buffers in message but found 6"}};
+
+  for (const auto& c : cases) {
+    SCOPED_TRACE(c.message);
+    nanoarrow::UniqueBuffer message;
+    nanoarrow::UniqueBuffer body;
+    ASSERT_NO_FATAL_FAILURE(MakeViewRecordBatchMessage(
+        c.n_counts, c.counts.data(), c.n_buffers, message.get(), body.get()));
+
+    struct ArrowBufferView data;
+    data.data.as_uint8 = message->data;
+    data.size_bytes = message->size_bytes;
+    ASSERT_EQ(ArrowIpcDecoderVerifyHeader(decoder.get(), data, &error), NANOARROW_OK)
+        << error.message;
+    EXPECT_EQ(ArrowIpcDecoderDecodeHeader(decoder.get(), data, &error), EINVAL);
+    EXPECT_EQ(std::string(error.message), c.message);
   }
 }

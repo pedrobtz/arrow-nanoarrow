@@ -60,11 +60,12 @@ PASSED=0
 FAILED=0
 SKIPPED=0
 
-# Known files that are expected to be skipped (unsupported types)
+# Known files that are expected to be skipped (types the IPC reader decodes but the
+# testing JSON reader does not support)
 SKIP_PATTERNS=(
-    "generated_list_view"      # ListView not supported
-    "generated_binary_view"    # BinaryView not supported
-    "generated_run_end_encoded" # REE not supported
+    "generated_list_view"      # ListView not supported by the JSON reader
+    "generated_binary_view"    # BinaryView not supported by the JSON reader
+    "generated_run_end_encoded" # REE not supported by the JSON reader
 )
 
 # Function to check if a file should be skipped
